@@ -17,8 +17,10 @@ from tabmailer.config import (
     SavedJob,
     SubjectTemplate,
     load_settings,
+    normalise_server_url,
     save_settings,
     save_token_secret,
+    site_from_url,
     upsert_job,
     upsert_list,
     upsert_template,
@@ -86,11 +88,27 @@ def step(label: str) -> None:
 with st.sidebar:
     st.markdown("### Tableau Report Mailer")
 
+    # "configured" only means the fields are filled in; "connected" means a call
+    # to Tableau actually succeeded this session. Conflating them hid a broken
+    # server URL behind a green badge.
     tab_ok = settings.tableau.is_configured
+    # The sidebar renders before the Compose tab, so also treat an already-loaded
+    # workbook list as proof of a working connection - otherwise the badge would
+    # always lag one rerun behind.
+    tab_live = (
+        bool(st.session_state.get("tableau_verified"))
+        or st.session_state.get("workbooks") is not None
+    )
     gm_ok = gmail.is_authorised()
     gm_ready = gmail.client_secret_present()
+    if not tab_ok:
+        tab_pill = pill(False, "Tableau not set up")
+    elif tab_live:
+        tab_pill = pill(True, "Tableau connected")
+    else:
+        tab_pill = pill(False, "Tableau not verified", warn=True)
     st.markdown(
-        pill(tab_ok, "Tableau connected" if tab_ok else "Tableau not set up")
+        tab_pill
         + pill(gm_ok, "Gmail connected" if gm_ok else ("Gmail not authorised" if gm_ready else "Gmail not set up"),
                warn=gm_ready and not gm_ok),
         unsafe_allow_html=True,
@@ -114,20 +132,28 @@ with st.sidebar:
         )
         c1, c2 = st.columns(2)
         if c1.button("Save", use_container_width=True, key="save_tab"):
-            settings.tableau.server_url = server_url.strip()
-            settings.tableau.site_content_url = site_url.strip()
+            # People paste the whole address bar; keep only scheme://host, and
+            # lift the site out of the pasted URL if the site box is empty.
+            settings.tableau.server_url = normalise_server_url(server_url)
+            settings.tableau.site_content_url = (
+                site_url.strip() or site_from_url(server_url)
+            )
             settings.tableau.token_name = token_name.strip()
             if token_secret:
                 save_token_secret(token_secret.strip())
             persist()
             st.session_state.workbooks = None
-            st.success("Saved")
+            st.session_state.views = {}
+            st.session_state.tableau_verified = False
+            st.success(f"Saved · {settings.tableau.server_url}")
             st.rerun()
         if c2.button("Test", use_container_width=True, key="test_tab"):
             try:
                 info = TableauClient(settings.tableau).test_connection()
+                st.session_state.tableau_verified = True
                 st.success(f"Connected to '{info['site']}' (API {info['api_version']})")
             except TableauError as exc:
+                st.session_state.tableau_verified = False
                 st.error(str(exc))
 
     with st.expander("Gmail connection", expanded=False):
@@ -221,7 +247,9 @@ def _render_compose() -> None:
         with c1, st.spinner("Loading workbooks from Tableau…"):
             try:
                 st.session_state.workbooks = TableauClient(settings.tableau).list_workbooks()
+                st.session_state.tableau_verified = True
             except TableauError as exc:
+                st.session_state.tableau_verified = False
                 st.error(str(exc))
                 return
     workbooks = st.session_state.workbooks or []

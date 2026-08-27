@@ -7,6 +7,7 @@ exactly what will go out before anything is actually emailed.
 from __future__ import annotations
 
 import datetime as dt
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,6 +68,32 @@ def _slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "-", text).strip("-") or "view"
 
 
+def _redundant_prefix(names: Sequence[str]) -> str:
+    """The shared 'Workbook Name: ' prefix Tableau view names often carry.
+
+    Every sheet in a workbook is commonly named ``Daily Sales Report: ASM Area
+    Wise``. Repeating that on every tab wastes most of Excel's 31-character tab
+    limit and truncates the part that actually distinguishes them, so it gets
+    stripped when - and only when - it is common to all the selected views.
+    """
+    if len(names) < 2:
+        return ""
+    prefix = os.path.commonprefix([n for n in names])
+    # Only cut at a separator, never mid-word.
+    match = re.match(r"^(.*[:–—|-]\s*)", prefix)
+    if not match:
+        return ""
+    candidate = match.group(1)
+    # Never strip so much that a name would disappear.
+    if any(not n[len(candidate):].strip() for n in names):
+        return ""
+    return candidate
+
+
+def _short_name(name: str, prefix: str) -> str:
+    return name[len(prefix):].strip() if prefix and name.startswith(prefix) else name
+
+
 def build(
     job: SavedJob,
     settings: Settings,
@@ -103,6 +130,8 @@ def build(
         specs: list[excel.SheetSpec] = []
         per_view_specs: list[tuple[ViewInfo, list[excel.SheetSpec]]] = []
 
+        prefix = _redundant_prefix([v.name for v in crosstab_views])
+
         for i, view in enumerate(crosstab_views):
             if progress:
                 progress(f"Downloading crosstab: {view.name}", i / max(total, 1))
@@ -116,17 +145,18 @@ def build(
             if not raws:
                 result.warnings.append(f"'{view.name}' returned no data and was skipped.")
                 continue
+            short = _short_name(view.name, prefix)
             local: list[excel.SheetSpec] = []
             for n, raw in enumerate(raws):
                 # A dashboard crosstab comes back as one tab per worksheet.
-                tab = view.name if len(raws) == 1 else f"{view.name} - {raw.name}"
+                tab = short if len(raws) == 1 else f"{short} - {raw.name}"
                 title = tab.upper()
                 local.append(
                     excel.SheetSpec(
                         tab_name=tab,
                         title=title,
                         raw=raw,
-                        subtitle=f"{job.workbook_name}  ·  {view.name}",
+                        subtitle=f"{job.workbook_name}  ·  {short}",
                     )
                 )
             specs.extend(local)

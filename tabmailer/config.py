@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv, set_key
 
@@ -30,6 +32,44 @@ load_dotenv(ENV_PATH)
 
 
 # ---------------------------------------------------------------------------
+# Server URL handling
+# ---------------------------------------------------------------------------
+
+_SITE_IN_URL = re.compile(r"/(?:#/)?(?:site|t)/([^/?#]+)", re.I)
+
+
+def normalise_server_url(url: str) -> str:
+    """Reduce any Tableau URL to just scheme://host.
+
+    People paste the whole address bar - ``https://pod.online.tableau.com/#/site/acme/
+    workbooks`` - but the REST client builds its endpoints by appending
+    ``/api/<version>/...`` to whatever it is given.  Everything after ``#`` is a
+    fragment, so an un-trimmed URL sends every API call to the site homepage,
+    which answers with HTML.  The client then can't parse the version and every
+    later call fails with "Invalid version: 'Unknown'".
+    """
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if not re.match(r"^https?://", url, re.I):
+        url = "https://" + url.lstrip("/")
+    parsed = urlparse(url)
+    if not parsed.netloc:
+        return url.rstrip("/")
+    return f"{parsed.scheme.lower()}://{parsed.netloc}"
+
+
+def site_from_url(url: str) -> str:
+    """Pull the site content URL out of a pasted Tableau address, if present.
+
+    ``https://pod.online.tableau.com/#/site/acme/workbooks`` -> ``acme``.
+    The Default site has no ``/site/`` segment, so this returns "".
+    """
+    match = _SITE_IN_URL.search(url or "")
+    return match.group(1) if match else ""
+
+
+# ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
 
@@ -40,6 +80,10 @@ class TableauSettings:
     site_content_url: str = ""  # from /#/site/<this>/ - blank for Default
     token_name: str = ""
     verify_ssl: bool = True
+
+    def __post_init__(self) -> None:
+        # Repair anything already saved with a full browser URL.
+        self.server_url = normalise_server_url(self.server_url)
 
     @property
     def token_secret(self) -> str:

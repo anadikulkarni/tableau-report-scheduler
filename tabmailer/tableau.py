@@ -13,7 +13,19 @@ from typing import Iterator, Mapping, Sequence
 
 import tableauserverclient as TSC
 
-from .config import TableauSettings
+from .config import TableauSettings, normalise_server_url
+
+# Comfortably above the 3.8 that crosstab export needs, and below anything a
+# current Tableau Cloud site would reject.
+FALLBACK_API_VERSION = "3.19"
+
+
+def _is_valid_version(version: object) -> bool:
+    try:
+        major, _, minor = str(version).partition(".")
+        return major.isdigit() and minor.isdigit()
+    except Exception:  # noqa: BLE001
+        return False
 
 
 class TableauError(RuntimeError):
@@ -77,9 +89,30 @@ class TableauClient:
             raise TableauError("No Tableau personal access token configured.")
         self.settings = settings
         self.max_age_minutes = max_age_minutes
-        self.server = TSC.Server(settings.server_url.rstrip("/"), use_server_version=True)
+        self._sheet_type_cache: dict[str, str] | None = None
+
+        base_url = normalise_server_url(settings.server_url)
+        # Build without version negotiation so that HTTP options (proxy, TLS) are
+        # in place before the first outgoing request.
+        self.server = TSC.Server(base_url)
         if not settings.verify_ssl:
             self.server.add_http_options({"verify": False})
+
+        try:
+            self.server.use_server_version()
+        except Exception:  # noqa: BLE001 - handled by the validity check below
+            pass
+
+        # tableauserverclient answers "Unknown" when the version probe gets a
+        # non-XML reply (a wrong URL returns the site's HTML). Left alone, that
+        # surfaces much later as an opaque "Invalid version: 'Unknown'", so pin a
+        # known-good version instead - Tableau accepts any version up to its own.
+        if not _is_valid_version(self.server.version):
+            self.server.version = FALLBACK_API_VERSION
+
+    @property
+    def base_url(self) -> str:
+        return self.server.server_address
 
     @contextmanager
     def session(self) -> Iterator[TSC.Server]:
@@ -121,16 +154,41 @@ class TableauClient:
         ]
         return sorted(books, key=lambda w: (w.project.lower(), w.name.lower()))
 
+    def _sheet_types(self, server) -> dict[str, str]:
+        """Map view id -> 'view' | 'dashboard' | 'story' for the whole site.
+
+        The per-workbook views endpoint (``/workbooks/{id}/views``) never returns
+        ``sheetType``, with or without a ``fields`` parameter - only the
+        site-level ``/views`` query does. So dashboards can only be told apart
+        from worksheets by cross-referencing that.
+        """
+        if self._sheet_type_cache is not None:
+            return self._sheet_type_cache
+
+        types: dict[str, str] = {}
+        try:
+            options = TSC.RequestOptions()
+            options._all_fields = True
+            for view in TSC.Pager(server.views, options):
+                if view.id and view.sheet_type:
+                    types[view.id] = view.sheet_type.lower()
+        except Exception:  # noqa: BLE001 - enrichment only; fall back below
+            pass
+
+        self._sheet_type_cache = types
+        return types
+
     def list_views(self, workbook_id: str) -> list[ViewInfo]:
         with self.session() as server:
             workbook = server.workbooks.get_by_id(workbook_id)
             server.workbooks.populate_views(workbook)
             views = list(workbook.views or [])
+            types = self._sheet_types(server)
         return [
             ViewInfo(
                 id=v.id,
                 name=v.name,
-                sheet_type=(v.sheet_type or "view").lower(),
+                sheet_type=types.get(v.id) or (v.sheet_type or "view").lower(),
                 content_url=v.content_url or "",
             )
             for v in views
