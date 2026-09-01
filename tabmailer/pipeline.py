@@ -36,6 +36,7 @@ class BuildResult:
     specs: list[excel.SheetSpec] = field(default_factory=list)
     files: list[OutputFile] = field(default_factory=list)
     inline_images: list[gmail.InlineImage] = field(default_factory=list)
+    body_tables: list[gmail.BodyTable] = field(default_factory=list)
     subject: str = ""
     body: str = ""
     context: dict = field(default_factory=dict)
@@ -48,7 +49,7 @@ class BuildResult:
 
     @property
     def has_content(self) -> bool:
-        return bool(self.files or self.inline_images)
+        return bool(self.files or self.inline_images or self.body_tables)
 
 
 def report_options(job: SavedJob, title: str, subtitle: str) -> excel.ReportOptions:
@@ -59,8 +60,7 @@ def report_options(job: SavedJob, title: str, subtitle: str) -> excel.ReportOpti
         negatives_red=job.negatives_red,
         banded_rows=job.banded_rows,
         autofilter=job.autofilter,
-        freeze_panes=job.freeze_panes,
-        contents_sheet=job.contents_sheet,
+        freeze_mode=job.freeze_mode,
     )
 
 
@@ -104,9 +104,36 @@ def build(
     """Fetch everything the job asks for and format it. Sends nothing."""
     result = BuildResult()
     by_id = {v.id: v for v in views}
+    by_name = {v.name: v for v in views}
 
-    crosstab_views = [by_id[i] for i in job.view_ids if i in by_id]
+    def resolve(ids: Sequence[str], names: Sequence[str]) -> list[ViewInfo]:
+        """IDs first, falling back to names.
+
+        Republishing a workbook mints new view ids, which would silently drop
+        sheets from a saved job. Names survive that, so they are the backstop.
+        """
+        found: list[ViewInfo] = []
+        seen: set[str] = set()
+        for view_id in ids:
+            view = by_id.get(view_id)
+            if view and view.id not in seen:
+                found.append(view)
+                seen.add(view.id)
+        if len(found) < len(ids):
+            for name in names:
+                view = by_name.get(name)
+                if view and view.id not in seen:
+                    found.append(view)
+                    seen.add(view.id)
+        return found
+
+    crosstab_views = resolve(job.view_ids, job.view_names)
     dashboard_views = [by_id[i] for i in job.dashboard_view_ids if i in by_id]
+    body_table_views = resolve(job.body_table_view_ids, job.body_table_view_names)
+
+    # A view shown as a table in the email should not also become a tab.
+    body_ids = {v.id for v in body_table_views}
+    crosstab_views = [v for v in crosstab_views if v.id not in body_ids]
 
     view_names = [v.name for v in crosstab_views] or [v.name for v in dashboard_views]
     context = templates.build_context(
@@ -117,20 +144,56 @@ def build(
     )
     result.context = context
     result.subject = templates.render(job.subject, context)
-    result.body = templates.render(job.body, context)
-    if settings.signature:
-        result.body = f"{result.body}\n\n{templates.render(settings.signature, context)}"
+    body_main = templates.render(job.body, context)
 
     report_title = templates.render(job.report_title or job.workbook_name, context)
     client = TableauClient(settings.tableau)
+
+    # One prefix for the whole job, so a view shown in the email body is named
+    # the same way as one that became a tab.
+    prefix = _redundant_prefix(
+        [v.name for v in (*crosstab_views, *body_table_views, *dashboard_views)]
+    )
+
+    # -- tables that go inside the email body -------------------------------
+    if body_table_views:
+        opts = report_options(job, report_title, job.workbook_name)
+        for view in body_table_views:
+            if progress:
+                progress(f"Building email table: {view.name}", 0.0)
+            try:
+                data = client.download_crosstab(view.id, job.filters)
+            except TableauError as exc:
+                result.warnings.append(f"Email table for '{view.name}' failed: {exc}")
+                continue
+            raws = excel.read_crosstab(data)
+            if not raws:
+                result.warnings.append(f"'{view.name}' returned no data for the email table.")
+                continue
+            short = _short_name(view.name, prefix)
+            for raw in raws:
+                spec = excel.SheetSpec(tab_name=short, title=short, raw=raw)
+                result.body_tables.append(
+                    gmail.BodyTable(
+                        title=short,
+                        html=excel.email_table_html(spec, opts, job.body_table_max_rows),
+                        text=excel.email_table_text(spec, opts, job.body_table_max_rows),
+                    )
+                )
+
+    # Tables land where the template puts {tables}; otherwise straight after the
+    # message text but still above the signature.
+    if result.body_tables and templates.TABLES_TOKEN not in body_main:
+        body_main = f"{body_main}\n\n{templates.TABLES_TOKEN}"
+    if settings.signature:
+        body_main = f"{body_main}\n\n{templates.render(settings.signature, context)}"
+    result.body = body_main
 
     # -- crosstabs ---------------------------------------------------------
     if crosstab_views:
         total = len(crosstab_views) + len(dashboard_views)
         specs: list[excel.SheetSpec] = []
         per_view_specs: list[tuple[ViewInfo, list[excel.SheetSpec]]] = []
-
-        prefix = _redundant_prefix([v.name for v in crosstab_views])
 
         for i, view in enumerate(crosstab_views):
             if progress:
@@ -236,6 +299,7 @@ def send(
         body=result.body,
         attachments=[gmail.Attachment(f.filename, f.content) for f in result.files],
         inline_images=result.inline_images,
+        body_tables=result.body_tables,
         sender_name=settings.sender_name,
     )
 

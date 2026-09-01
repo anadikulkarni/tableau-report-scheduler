@@ -204,11 +204,20 @@ class ReportOptions:
     negatives_red: bool = False
     banded_rows: bool = False
     autofilter: bool = True
-    freeze_panes: bool = True
+    # "auto" freezes only sheets wide enough to need it - locked panes on a
+    # narrow sheet just get in the way.
+    freeze_mode: str = "auto"  # auto | always | never
+    freeze_min_columns: int = 12
     highlight_totals: bool = True
-    contents_sheet: bool = True
     landscape: bool = True
     fit_to_width: bool = True
+
+    def should_freeze(self, n_cols: int) -> bool:
+        if self.freeze_mode == "always":
+            return True
+        if self.freeze_mode == "never":
+            return False
+        return n_cols >= self.freeze_min_columns
 
     def kit(self) -> S.StyleKit:
         theme = S.THEMES.get(self.theme, S.THEMES[S.DEFAULT_THEME])
@@ -386,7 +395,7 @@ def _write_sheet(ws: Worksheet, spec: SheetSpec, opts: ReportOptions, kit: S.Sty
     ws.sheet_view.zoomScale = S.ZOOM
     ws.sheet_properties.tabColor = kit.theme.accent
 
-    if opts.freeze_panes:
+    if opts.should_freeze(n_cols):
         ws.freeze_panes = ws.cell(row=data_start, column=layout.label_cols + 1)
     if opts.autofilter and len(header_block) and last_row >= data_start:
         header_row = header_start + len(header_block) - 1
@@ -406,45 +415,6 @@ def _write_sheet(ws: Worksheet, spec: SheetSpec, opts: ReportOptions, kit: S.Sty
     ws.oddFooter.left.color = ws.oddFooter.right.color = S.SUBTITLE_TEXT
 
 
-def _write_contents(ws: Worksheet, specs: Sequence[SheetSpec], opts: ReportOptions, kit: S.StyleKit) -> None:
-    ws.sheet_view.showGridLines = False
-    ws.sheet_properties.tabColor = kit.theme.accent
-
-    ws.cell(row=1, column=1, value=opts.report_title).font = kit.title_font
-    ws.row_dimensions[1].height = S.TITLE_ROW_HEIGHT
-    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=4)
-
-    generated = dt.datetime.now().strftime("%d-%b-%Y %H:%M")
-    sub = ws.cell(row=2, column=1, value=f"{opts.subtitle}  ·  generated {generated}".strip(" ·"))
-    sub.font = kit.subtitle_font
-    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=4)
-    ws.row_dimensions[3].height = S.SPACER_ROW_HEIGHT
-
-    for c, label in enumerate(["#", "Worksheet", "Rows", "Columns"], start=1):
-        cell = ws.cell(row=4, column=c, value=label)
-        cell.font = kit.header_font
-        cell.fill = kit.header_fill
-        cell.alignment = kit.header_align
-        cell.border = kit.header_border
-    ws.row_dimensions[4].height = 20.0
-
-    for i, spec in enumerate(specs, start=1):
-        row = 4 + i
-        layout = spec.layout or detect_layout(spec.raw.rows)
-        values = [i, spec.title, max(0, spec.raw.n_rows - layout.header_rows), spec.raw.n_cols]
-        for c, value in enumerate(values, start=1):
-            cell = ws.cell(row=row, column=c, value=value)
-            cell.font = kit.body_font
-            cell.border = kit.cell_border
-            cell.alignment = kit.label_align if c == 2 else kit.value_align
-        link = ws.cell(row=row, column=2)
-        link.hyperlink = f"#'{spec.tab_name}'!A1"
-        link.font = Font(name=S.BODY_FONT, size=S.BODY_SIZE, color="0563C1", underline="single")
-
-    for col, width in zip("ABCD", (6, 46, 12, 12)):
-        ws.column_dimensions[col].width = width
-
-
 def build_workbook(specs: Sequence[SheetSpec], opts: ReportOptions) -> openpyxl.Workbook:
     kit = opts.kit()
     wb = openpyxl.Workbook()
@@ -453,9 +423,6 @@ def build_workbook(specs: Sequence[SheetSpec], opts: ReportOptions) -> openpyxl.
     taken: set[str] = set()
     for spec in specs:
         spec.tab_name = safe_tab_name(spec.tab_name, taken)
-
-    if opts.contents_sheet and len(specs) > 1:
-        _write_contents(wb.create_sheet("Contents"), specs, opts, kit)
 
     for spec in specs:
         _write_sheet(wb.create_sheet(spec.tab_name), spec, opts, kit)
@@ -604,3 +571,141 @@ def workbook_bytes(wb: openpyxl.Workbook) -> bytes:
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Email-body tables
+#
+# A small crosstab reads better inline in the email than as a spreadsheet tab.
+# Mail clients (Gmail especially) drop <style> blocks, so unlike preview_html
+# every rule here has to be written inline on the element itself.
+# ---------------------------------------------------------------------------
+
+
+def _table_parts(spec: SheetSpec, kit: S.StyleKit):
+    raw = spec.raw
+    layout = spec.layout or detect_layout(raw.rows)
+    header_block = raw.rows[: layout.header_rows]
+    data_block = raw.rows[layout.header_rows :]
+    n_cols = raw.n_cols
+
+    col_formats: list[str | None] = []
+    for c in range(n_cols):
+        source = raw.col_formats[c] if c < len(raw.col_formats) else "General"
+        values = [r[c] for r in data_block if c < len(r)]
+        col_formats.append(None if c < layout.label_cols else _infer_format(values, source, kit))
+    return layout, header_block, data_block, n_cols, col_formats
+
+
+def _row_kind(drow, layout: Layout, highlight: bool) -> str:
+    label = next(
+        (str(drow[c]) for c in range(min(layout.label_cols, len(drow))) if not _is_blank(drow[c])),
+        "",
+    )
+    if not highlight:
+        return ""
+    if _GRAND_TOTAL_RE.match(label):
+        return "grand"
+    if _SUBTOTAL_RE.search(label):
+        return "sub"
+    return ""
+
+
+def email_table_html(spec: SheetSpec, opts: ReportOptions, max_rows: int = 100) -> str:
+    """Render one crosstab as a self-contained, inline-styled HTML table."""
+    kit = opts.kit()
+    t = kit.theme
+    layout, header_block, data_block, n_cols, col_formats = _table_parts(spec, kit)
+    if not n_cols:
+        return ""
+
+    border = f"1px solid #{S.GRID_LINE}"
+    base = f"padding:5px 10px;border:{border};font-size:13px;"
+    out: list[str] = [
+        "<div style=\"margin:18px 0\">",
+        f'<div style="font-family:Calibri,\'Segoe UI\',Arial,sans-serif;font-size:14px;'
+        f'font-weight:700;color:#1a1a1a;margin-bottom:6px">{_esc(spec.title)}</div>',
+        '<table cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;'
+        "font-family:Calibri,'Segoe UI',Arial,sans-serif;background:#ffffff\">",
+    ]
+
+    for i, hrow in enumerate(header_block):
+        is_last = i == len(header_block) - 1
+        bg = t.accent if is_last else t.light80
+        colour = "#ffffff" if is_last else "#000000"
+        out.append("<tr>")
+        c = 0
+        while c < n_cols:
+            value = hrow[c] if c < len(hrow) else None
+            span = 1
+            if not is_last and not _is_blank(value):
+                end = c + 1
+                while end < n_cols and _is_blank(hrow[end] if end < len(hrow) else None):
+                    end += 1
+                span = end - c
+            colspan = f' colspan="{span}"' if span > 1 else ""
+            out.append(
+                f'<th{colspan} style="{base}background:#{bg};color:{colour};'
+                f'font-weight:700;text-align:center">{_esc(value or "")}</th>'
+            )
+            c += span
+        out.append("</tr>")
+
+    for i, drow in enumerate(data_block[:max_rows]):
+        kind = _row_kind(drow, layout, opts.highlight_totals)
+        if kind == "grand":
+            row_style = f"background:#{S.GRAND_TOTAL_FILL};font-weight:700;"
+        elif kind == "sub":
+            row_style = f"background:#{t.light60};font-weight:700;"
+        else:
+            row_style = "background:#ffffff;"
+        out.append("<tr>")
+        for c in range(n_cols):
+            value = drow[c] if c < len(drow) else None
+            align = "right" if c >= layout.label_cols else "left"
+            out.append(
+                f'<td style="{base}{row_style}text-align:{align}">'
+                f"{_esc(_fmt_preview(value, col_formats[c]))}</td>"
+            )
+        out.append("</tr>")
+
+    out.append("</table>")
+    if len(data_block) > max_rows:
+        out.append(
+            f'<div style="font-size:11px;color:#{S.SUBTITLE_TEXT};margin-top:4px">'
+            f"+ {len(data_block) - max_rows:,} more rows</div>"
+        )
+    out.append("</div>")
+    return "".join(out)
+
+
+def email_table_text(spec: SheetSpec, opts: ReportOptions, max_rows: int = 100) -> str:
+    """Plain-text rendition of the same table, for the text/plain part."""
+    kit = opts.kit()
+    layout, header_block, data_block, n_cols, col_formats = _table_parts(spec, kit)
+    if not n_cols:
+        return ""
+
+    rows: list[list[str]] = []
+    for hrow in header_block:
+        rows.append([str(hrow[c] or "") if c < len(hrow) else "" for c in range(n_cols)])
+    for drow in data_block[:max_rows]:
+        rows.append(
+            [
+                _fmt_preview(drow[c] if c < len(drow) else None, col_formats[c])
+                for c in range(n_cols)
+            ]
+        )
+
+    widths = [max((len(r[c]) for r in rows), default=0) for c in range(n_cols)]
+    lines = [spec.title, ""]
+    for i, row in enumerate(rows):
+        cells = []
+        for c, cell in enumerate(row):
+            cells.append(cell.ljust(widths[c]) if c < layout.label_cols else cell.rjust(widths[c]))
+        lines.append("  ".join(cells).rstrip())
+        if i == len(header_block) - 1:
+            lines.append("-" * min(len(lines[-1]), 100))
+    if len(data_block) > max_rows:
+        lines.append(f"+ {len(data_block) - max_rows:,} more rows")
+    return "\n".join(lines)

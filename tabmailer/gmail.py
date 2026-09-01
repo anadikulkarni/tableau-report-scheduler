@@ -58,6 +58,15 @@ class InlineImage:
 
 
 @dataclass
+class BodyTable:
+    """A crosstab rendered into the email itself rather than attached."""
+
+    title: str
+    html: str
+    text: str
+
+
+@dataclass
 class Message:
     to: list[str]
     subject: str
@@ -66,6 +75,7 @@ class Message:
     bcc: list[str] = field(default_factory=list)
     attachments: list[Attachment] = field(default_factory=list)
     inline_images: list[InlineImage] = field(default_factory=list)
+    body_tables: list[BodyTable] = field(default_factory=list)
     sender_name: str = ""
     reply_to: str = ""
 
@@ -163,14 +173,41 @@ def revoke_local_token() -> None:
 # ---------------------------------------------------------------------------
 
 
-def text_to_html(body: str, inline_images: Sequence[InlineImage] = ()) -> str:
-    paragraphs = "".join(
-        f"<p style='margin:0 0 12px'>{line or '&nbsp;'}</p>"
-        for line in (
-            l.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            for l in body.split("\n")
+TABLES_TOKEN = "{tables}"
+
+
+def text_with_tables(body: str, tables: Sequence[BodyTable] = ()) -> str:
+    """Plain-text body with the {tables} marker replaced by text tables."""
+    rendered = "\n\n".join(t.text for t in tables if t.text)
+    if TABLES_TOKEN in body:
+        return body.replace(TABLES_TOKEN, rendered)
+    return f"{body}\n\n{rendered}" if rendered else body
+
+
+def text_to_html(
+    body: str,
+    inline_images: Sequence[InlineImage] = (),
+    tables: Sequence[BodyTable] = (),
+) -> str:
+    # Split on the marker first so the tables are not HTML-escaped as text.
+    segments = body.split(TABLES_TOKEN) if TABLES_TOKEN in body else [body]
+    table_html = "".join(t.html for t in tables if t.html)
+
+    def to_paragraphs(chunk: str) -> str:
+        return "".join(
+            f"<p style='margin:0 0 12px'>{line or '&nbsp;'}</p>"
+            for line in (
+                l.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                for l in chunk.split("\n")
+            )
         )
-    )
+
+    paragraphs = to_paragraphs(segments[0])
+    for segment in segments[1:]:
+        paragraphs += table_html + to_paragraphs(segment)
+    if len(segments) == 1 and table_html:
+        paragraphs += table_html
+
     images = ""
     for img in inline_images:
         caption = (
@@ -202,8 +239,10 @@ def build_message(msg: Message, sender: str = "") -> EmailMessage:
         email["Reply-To"] = msg.reply_to
     email["Subject"] = msg.subject
 
-    email.set_content(msg.body or "")
-    email.add_alternative(text_to_html(msg.body or "", msg.inline_images), subtype="html")
+    email.set_content(text_with_tables(msg.body or "", msg.body_tables))
+    email.add_alternative(
+        text_to_html(msg.body or "", msg.inline_images, msg.body_tables), subtype="html"
+    )
 
     if msg.inline_images:
         html_part = email.get_payload()[-1]

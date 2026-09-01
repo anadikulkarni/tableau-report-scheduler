@@ -127,6 +127,11 @@ class SavedJob:
     view_names: list[str] = field(default_factory=list)
     content_mode: str = "crosstab"  # crosstab | dashboard | both
     dashboard_view_ids: list[str] = field(default_factory=list)
+    # Views whose crosstab is rendered as a table in the email body instead of
+    # becoming a tab in the workbook.
+    body_table_view_ids: list[str] = field(default_factory=list)
+    body_table_view_names: list[str] = field(default_factory=list)
+    body_table_max_rows: int = 100
     one_file_per_view: bool = False
     subject: str = ""
     body: str = ""
@@ -137,11 +142,18 @@ class SavedJob:
     theme: str = "Blue"
     negatives_red: bool = False
     banded_rows: bool = False
-    contents_sheet: bool = True
     autofilter: bool = True
-    freeze_panes: bool = True
+    freeze_mode: str = "auto"  # auto | always | never
     filters: dict[str, str] = field(default_factory=dict)
     report_title: str = ""
+    builtin: bool = False  # shipped preset - shown first on the Send report tab
+
+    def __post_init__(self) -> None:
+        # Jobs saved before freezing became a three-way choice stored a bool.
+        if isinstance(self.freeze_mode, bool):
+            self.freeze_mode = "always" if self.freeze_mode else "never"
+        if self.freeze_mode not in {"auto", "always", "never"}:
+            self.freeze_mode = "auto"
 
 
 DEFAULT_TEMPLATES = [

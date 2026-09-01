@@ -18,6 +18,10 @@ import string
 from typing import Any, Iterable, Mapping
 
 DEFAULT_DATE_FMT = "%d.%m.%Y"
+
+# Where crosstab tables get spliced into an email body. Left in place by the
+# renderer (it is not a known token) and substituted at send time.
+TABLES_TOKEN = "{tables}"
 _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 

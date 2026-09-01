@@ -62,6 +62,7 @@ if "settings" not in st.session_state:
 st.session_state.setdefault("workbooks", None)
 st.session_state.setdefault("views", {})
 st.session_state.setdefault("build", None)
+st.session_state.setdefault("build_job", None)
 st.session_state.setdefault("job", SavedJob(name="Untitled"))
 
 settings = st.session_state.settings
@@ -225,8 +226,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_compose, tab_preview, tab_lists, tab_history = st.tabs(
-    ["Compose", "Preview & send", "Lists & templates", "History"]
+tab_send, tab_compose, tab_preview, tab_lists, tab_history = st.tabs(
+    ["Send report", "Compose", "Preview & send", "Lists & templates", "History"]
 )
 
 
@@ -328,6 +329,27 @@ def _render_compose() -> None:
         dash_selected = [dash_by_name[n] for n in chosen_dash]
         job.dashboard_view_ids = [v.id for v in dash_selected]
 
+    chosen_body = st.multiselect(
+        "Small sheets → table in the email body (not a tab in the Excel)",
+        options=list(sheet_by_label),
+        default=[lbl for lbl, v in sheet_by_label.items() if v.id in job.body_table_view_ids],
+        help="Good for a short summary the reader should see without opening the attachment. "
+             "Anything picked here is left out of the workbook.",
+    )
+    body_selected = [sheet_by_label[lbl] for lbl in chosen_body]
+    job.body_table_view_ids = [v.id for v in body_selected]
+    job.body_table_view_names = [v.name for v in body_selected]
+
+    # Keep the two lists disjoint so a sheet never lands in both places.
+    overlap = set(job.body_table_view_ids) & set(job.view_ids)
+    if overlap:
+        job.view_ids = [i for i in job.view_ids if i not in overlap]
+        job.view_names = [v.name for v in selected if v.id not in overlap]
+        selected = [v for v in selected if v.id not in overlap]
+        st.caption(
+            f"{len(overlap)} sheet(s) moved out of the workbook because they go in the email body."
+        )
+
     if not selected and not dash_selected:
         st.warning("Pick at least one worksheet or dashboard.")
 
@@ -342,10 +364,20 @@ def _render_compose() -> None:
         format_func=lambda v: "One file, tab per sheet" if not v else "Separate file per sheet",
     )
     with c3:
+        freeze_modes = ["auto", "always", "never"]
+        job.freeze_mode = st.selectbox(
+            "Freeze header rows",
+            freeze_modes,
+            index=freeze_modes.index(job.freeze_mode) if job.freeze_mode in freeze_modes else 0,
+            format_func=lambda m: {
+                "auto": "Only on wide sheets (12+ columns)",
+                "always": "On every sheet",
+                "never": "Never",
+            }[m],
+            help="Locked panes on a narrow sheet are more annoying than useful.",
+        )
         cc1, cc2 = st.columns(2)
-        job.contents_sheet = cc1.checkbox("Contents tab", value=job.contents_sheet)
-        job.autofilter = cc2.checkbox("Auto-filter", value=job.autofilter)
-        job.freeze_panes = cc1.checkbox("Freeze headers", value=job.freeze_panes)
+        job.autofilter = cc1.checkbox("Auto-filter", value=job.autofilter)
         job.banded_rows = cc2.checkbox("Banded rows", value=job.banded_rows)
         job.negatives_red = cc1.checkbox("Negatives in red", value=job.negatives_red)
 
@@ -446,102 +478,184 @@ with tab_compose:
 
 
 # ---------------------------------------------------------------------------
+# Shared result renderer - used by the Send report tab and Preview & send
+# ---------------------------------------------------------------------------
+
+
+def build_result(target: SavedJob) -> None:
+    """Download and format the report, storing the outcome in session state."""
+    bar = st.progress(0.0, text="Starting...")
+    try:
+        all_views = st.session_state.views.get(target.workbook_id)
+        if all_views is None:
+            all_views = TableauClient(settings.tableau).list_views(target.workbook_id)
+            st.session_state.views[target.workbook_id] = all_views
+        st.session_state.build = pipeline.build(
+            target, settings, all_views,
+            progress=lambda msg, frac: bar.progress(min(frac, 1.0), text=msg),
+        )
+        st.session_state.build_job = target.name
+    except TableauError as exc:
+        st.session_state.build = None
+        st.error(str(exc))
+    finally:
+        bar.empty()
+
+
+def render_result(result: pipeline.BuildResult, target: SavedJob, key: str) -> None:
+    for warning in result.warnings:
+        st.warning(warning)
+
+    st.markdown("#### Email")
+    recipients = ", ".join(target.to) or "(no recipients yet)"
+    st.markdown(
+        f"<div class='tm-card'><b>To</b> {recipients}<br>"
+        + (f"<b>Cc</b> {', '.join(target.cc)}<br>" if target.cc else "")
+        + (f"<b>Bcc</b> {', '.join(target.bcc)}<br>" if target.bcc else "")
+        + f"<b>Subject</b> {result.subject}</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Render the body exactly as recipients will see it, tables included.
+    components.html(
+        gmail.text_to_html(result.body, result.inline_images, result.body_tables),
+        height=520 if result.body_tables else 220,
+        scrolling=True,
+    )
+
+    if result.files:
+        st.markdown("#### Attachments")
+        for f in result.files:
+            c1, c2 = st.columns([4, 1])
+            c1.markdown(
+                f"<div class='tm-card tm-mono'>{f.filename} &nbsp;&middot;&nbsp; "
+                f"{f.size_kb:,.0f} KB</div>", unsafe_allow_html=True
+            )
+            c2.download_button(
+                "Download", f.content, file_name=f.filename,
+                use_container_width=True, key=f"dl_{key}_{f.filename}",
+            )
+    if result.inline_images:
+        st.caption(f"{len(result.inline_images)} dashboard image(s) embedded in the email body")
+        for img in result.inline_images:
+            try:
+                st.image(img.content, caption=img.caption, use_container_width=True)
+            except Exception:  # noqa: BLE001 - a bad render shouldn't kill the page
+                st.warning(
+                    f"'{img.caption}' came back from Tableau as something that isn't a "
+                    f"readable image ({len(img.content):,} bytes). It will still be "
+                    "attached to the email, but check the view renders online."
+                )
+    if result.saved_paths:
+        st.caption("Saved locally: " + " | ".join(result.saved_paths))
+
+    if result.specs:
+        st.markdown("#### How the Excel will look")
+        components.html(
+            excel.preview_html(result.specs, pipeline.report_options(target, target.workbook_name, "")),
+            height=520, scrolling=True,
+        )
+
+    st.divider()
+    st.markdown("#### Send")
+    if not target.to:
+        st.warning("This report has no recipients. Add them on the Compose tab and save the job.")
+    elif not gmail.is_authorised():
+        st.warning("Connect Gmail in the sidebar before sending.")
+    else:
+        st.caption(
+            f"Sending {len(result.files)} attachment(s), {result.total_size_kb:,.0f} KB "
+            f"total, to {len(target.to)} recipient(s)."
+        )
+        c1, c2, _ = st.columns([1, 1, 2])
+        if c1.button("Send now", type="primary", use_container_width=True, key=f"send_{key}"):
+            try:
+                outcome = pipeline.send(result, target, settings, target.to, target.cc, target.bcc)
+                st.success(f"Sent from {outcome.get('sender', '')}.")
+                st.balloons()
+            except gmail.GmailError as exc:
+                st.error(str(exc))
+        if c2.button("Save as draft", use_container_width=True, key=f"draft_{key}"):
+            try:
+                pipeline.send(result, target, settings, target.to, target.cc, target.bcc, as_draft=True)
+                st.success("Draft saved in Gmail.")
+            except gmail.GmailError as exc:
+                st.error(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Send report - the one-click landing tab
+# ---------------------------------------------------------------------------
+
+
+def _render_send() -> None:
+    if not settings.tableau.is_configured:
+        st.info("Add your Tableau connection in the sidebar to get started.")
+        return
+    if not settings.jobs:
+        st.info(
+            "No saved reports yet. Build one on the **Compose** tab and click "
+            "**Save job** - it will then appear here as a one-click button."
+        )
+        return
+
+    st.markdown(
+        "<div class='tm-lede'>Pick a report, check it looks right, then send it.</div>",
+        unsafe_allow_html=True,
+    )
+
+    jobs = sorted(settings.jobs, key=lambda j: (not j.builtin, j.name.lower()))
+    for saved in jobs:
+        extras = []
+        if saved.body_table_view_names:
+            extras.append(f"{len(saved.body_table_view_names)} table in the email body")
+        if saved.dashboard_view_ids:
+            extras.append(f"{len(saved.dashboard_view_ids)} dashboard PDF")
+        detail = f"{saved.workbook_name} &middot; {len(saved.view_ids)} sheet(s) in the Excel"
+        if extras:
+            detail += " &middot; " + ", ".join(extras)
+
+        with st.container(border=True):
+            c1, c2 = st.columns([3, 1])
+            c1.markdown(f"**{saved.name}**")
+            c1.markdown(
+                f"<div style='color:#6b7280;font-size:0.85rem'>{detail}</div>",
+                unsafe_allow_html=True,
+            )
+            c1.caption("To: " + (", ".join(saved.to) if saved.to else "no recipients set"))
+            if c2.button("Build & review", type="primary", use_container_width=True,
+                         key=f"quick_{saved.name}"):
+                st.session_state.job = SavedJob(**vars(saved))
+                build_result(st.session_state.job)
+                st.rerun()
+
+    result = st.session_state.build
+    built_for = st.session_state.get("build_job")
+    if result and result.has_content and built_for:
+        st.divider()
+        st.markdown(f"### {built_for}")
+        render_result(result, st.session_state.job, "quick")
+
+
+with tab_send:
+    _render_send()
+
+
+# ---------------------------------------------------------------------------
 # Preview & send
 # ---------------------------------------------------------------------------
 
 with tab_preview:
-    if not (job.view_ids or job.dashboard_view_ids):
+    if not (job.view_ids or job.dashboard_view_ids or job.body_table_view_ids):
         st.info("Choose a workbook and some worksheets on the Compose tab first.")
     else:
         c1, c2 = st.columns([1, 3])
         if c1.button("Build report", type="primary", use_container_width=True):
-            bar = st.progress(0.0, text="Starting…")
-            try:
-                all_views = st.session_state.views.get(job.workbook_id, [])
-                st.session_state.build = pipeline.build(
-                    job, settings, all_views,
-                    progress=lambda msg, frac: bar.progress(min(frac, 1.0), text=msg),
-                )
-            except TableauError as exc:
-                st.session_state.build = None
-                st.error(str(exc))
-            finally:
-                bar.empty()
+            build_result(job)
 
-        result: pipeline.BuildResult | None = st.session_state.build
-
+        result = st.session_state.build
         if result and result.has_content:
-            for warning in result.warnings:
-                st.warning(warning)
-
-            st.markdown("#### Email")
-            recipients = ", ".join(job.to) or "(no recipients yet)"
-            st.markdown(
-                f"<div class='tm-card'><b>To</b> {recipients}<br>"
-                + (f"<b>Cc</b> {', '.join(job.cc)}<br>" if job.cc else "")
-                + (f"<b>Bcc</b> {', '.join(job.bcc)}<br>" if job.bcc else "")
-                + f"<b>Subject</b> {result.subject}</div>",
-                unsafe_allow_html=True,
-            )
-            st.text(result.body)
-
-            st.markdown("#### Attachments")
-            for f in result.files:
-                c1, c2 = st.columns([4, 1])
-                c1.markdown(
-                    f"<div class='tm-card tm-mono'>{f.filename} &nbsp;·&nbsp; "
-                    f"{f.size_kb:,.0f} KB</div>", unsafe_allow_html=True
-                )
-                c2.download_button(
-                    "Download", f.content, file_name=f.filename,
-                    use_container_width=True, key=f"dl_{f.filename}",
-                )
-            if result.inline_images:
-                st.caption(f"{len(result.inline_images)} dashboard image(s) embedded in the email body")
-                for img in result.inline_images:
-                    try:
-                        st.image(img.content, caption=img.caption, use_container_width=True)
-                    except Exception:  # noqa: BLE001 - a bad render shouldn't kill the page
-                        st.warning(
-                            f"'{img.caption}' came back from Tableau as something that isn't a "
-                            f"readable image ({len(img.content):,} bytes). It will still be "
-                            "attached to the email, but check the view renders online."
-                        )
-            if result.saved_paths:
-                st.caption("Saved locally: " + " · ".join(result.saved_paths))
-
-            if result.specs:
-                st.markdown("#### How the Excel will look")
-                components.html(
-                    excel.preview_html(result.specs, pipeline.report_options(job, job.workbook_name, "")),
-                    height=520, scrolling=True,
-                )
-
-            st.divider()
-            st.markdown("#### Send")
-            if not job.to:
-                st.warning("Add at least one recipient on the Compose tab.")
-            elif not gmail.is_authorised():
-                st.warning("Connect Gmail in the sidebar before sending.")
-            else:
-                st.caption(
-                    f"Sending {len(result.files)} attachment(s), {result.total_size_kb:,.0f} KB "
-                    f"total, to {len(job.to)} recipient(s)."
-                )
-                c1, c2, _ = st.columns([1, 1, 2])
-                if c1.button("Send now", type="primary", use_container_width=True):
-                    try:
-                        outcome = pipeline.send(result, job, settings, job.to, job.cc, job.bcc)
-                        st.success(f"Sent from {outcome.get('sender', '')}.")
-                        st.balloons()
-                    except gmail.GmailError as exc:
-                        st.error(str(exc))
-                if c2.button("Save as draft", use_container_width=True):
-                    try:
-                        pipeline.send(result, job, settings, job.to, job.cc, job.bcc, as_draft=True)
-                        st.success("Draft saved in Gmail.")
-                    except gmail.GmailError as exc:
-                        st.error(str(exc))
+            render_result(result, job, "main")
         elif result:
             st.warning("Nothing came back from Tableau for that selection.")
 

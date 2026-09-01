@@ -74,21 +74,49 @@ Or double-click `run.bat`.
 
 ## Using it
 
+### The quick way
+
+The app opens on **Send report**. Each saved report is one card with a
+**Build & review** button: it pulls fresh data from Tableau, then shows you the
+finished email and the attachment before anything is sent. **Send now** sends it;
+**Save as draft** puts it in Gmail for you to check first.
+
+A **Daily Sales Report** preset ships configured against the Primary Sales
+workbook: the five detail sheets become tabs in the Excel, and Channel Wise
+Overview is rendered as a table inside the email body rather than as a tab.
+Set the recipients once on the Compose tab, save the job, and from then on it is
+two clicks.
+
+### Building a new report
+
+
 The **Compose** tab walks top to bottom:
 
 | Step | What you choose |
 |---|---|
 | 1 · Workbook | Which Tableau workbook |
-| 2 · What to include | Worksheets → Excel crosstab, dashboards → PDF + inline image |
-| 3 · Excel formatting | Accent colour, one file vs file-per-sheet, contents tab, filters |
+| 2 · What to include | Worksheets → Excel crosstab, dashboards → PDF + inline image, small sheets → table in the email body |
+| 3 · Excel formatting | Accent colour, one file vs file-per-sheet, freeze rule, filters |
 | 4 · Email | Subject and body, from a saved template if you like |
 | 5 · Recipients | To / Cc / Bcc, or apply a saved distribution list |
 
-Then **Preview & send** builds everything and shows you exactly what will go out —
+**Preview & send** builds everything and shows you exactly what will go out —
 the rendered subject, the body, each attachment with its size, the dashboard
 images, and an HTML preview of the formatted Excel. Nothing is emailed until you
 click **Send now**. **Save as draft** puts it in Gmail instead, so you can check
 it in your own mailbox first.
+
+
+### Tables in the email body
+
+A small crosstab often reads better in the email than as a spreadsheet tab. Pick
+those sheets under **Small sheets → table in the email body**; they are left out
+of the workbook and rendered inline instead, styled like the Excel (header band,
+totals highlighted, accounting numbers).
+
+Put `{tables}` in the body where you want them. Without it they go after your
+message text but above the signature. The tables are written with inline styles
+throughout, because Gmail strips `<style>` blocks.
 
 ### Subject and file name tokens
 
@@ -147,8 +175,11 @@ The house style is lifted from `24.08.2026 - SALE REPORT FOR AUG 26.xlsm`:
   "Grand Total" gets grey. Both bold
 - **Numbers** — Excel accounting formats (`#,##0.00` with bracketed negatives);
   percentages and ₹ currency carried through from Tableau's own formatting
-- **Chrome** — thin borders, gridlines off, frozen header, auto-filter, A4
-  landscape fitted to one page wide, repeating header rows, page numbers in the footer
+- **Chrome** — thin borders, gridlines off, auto-filter, A4 landscape fitted to
+  one page wide, repeating header rows, page numbers in the footer
+- **Frozen panes** — by default only on sheets with 12+ columns, since locked
+  panes on a narrow sheet are more annoying than useful. Switch to always/never
+  per job
 
 Six accent themes ship in `tabmailer/style.py` (Blue, Indigo, Green, Orange,
 Amber, Slate). Adding another is one line in `THEMES`.
