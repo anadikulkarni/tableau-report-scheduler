@@ -11,14 +11,12 @@ import os
 import streamlit as st
 import streamlit.components.v1 as components
 
-from tabmailer import auth, excel, gmail, history, pipeline, style, templates
+from tabmailer import auth, excel, gmail, history, pipeline, store, style, templates
 from tabmailer.config import (
     DistributionList,
     GMAIL_CLIENT_PATH,
-    SETTINGS_PATH,
     SavedJob,
     SubjectTemplate,
-    is_ephemeral_host,
     load_settings,
     normalise_server_url,
     save_settings,
@@ -48,6 +46,8 @@ _SECRET_KEYS = (
     "GMAIL_CLIENT_ID",
     "GMAIL_CLIENT_SECRET",
     "GMAIL_REFRESH_TOKEN",
+    "GITHUB_TOKEN",
+    "GITHUB_GIST_ID",
 )
 try:
     for _key in _SECRET_KEYS:
@@ -100,8 +100,14 @@ settings = st.session_state.settings
 job: SavedJob = st.session_state.job
 
 
-def persist() -> None:
-    save_settings(st.session_state.settings)
+def persist() -> bool:
+    """Save settings, surfacing a failure rather than pretending it worked."""
+    try:
+        save_settings(st.session_state.settings)
+        return True
+    except store.StoreError as exc:
+        st.error(f"Not saved. {exc}")
+        return False
 
 
 def pill(ok: bool, text: str, warn: bool = False) -> str:
@@ -173,12 +179,13 @@ with st.sidebar:
             settings.tableau.token_name = token_name.strip()
             if token_secret:
                 save_token_secret(token_secret.strip())
-            persist()
+            saved = persist()
             st.session_state.workbooks = None
             st.session_state.views = {}
             st.session_state.tableau_verified = False
-            st.success(f"Saved · {settings.tableau.server_url}")
-            st.rerun()
+            if saved:
+                st.success(f"Saved · {settings.tableau.server_url}")
+                st.rerun()
         if c2.button("Test", width="stretch", key="test_tab"):
             try:
                 info = TableauClient(settings.tableau).test_connection()
@@ -227,40 +234,27 @@ with st.sidebar:
             "Keep a local copy of every file", value=settings.keep_local_copies
         )
         if st.button("Save defaults", width="stretch", key="save_def"):
-            persist()
-            st.success("Saved")
+            if persist():
+                st.success("Saved")
 
     st.divider()
-    if is_ephemeral_host():
+    _store = settings.store
+    if _store.kind == "gist" and _store.writable:
+        c1, c2 = st.columns([2, 1])
+        c1.caption("Saved reports and templates are shared with everyone.")
+        if c2.button("Reload", width="stretch", key="reload_settings",
+                     help="Pull in changes other people have saved."):
+            st.session_state.settings = load_settings()
+            st.rerun()
+    elif _store.kind == "gist":
+        st.error(f"Shared storage is unreachable, so nothing can be saved. {_store.detail}")
+    elif not _store.writable:
         st.warning(
-            "Hosted mode: anything you save here lasts only until the app "
-            "restarts. Use **Download settings** below and commit the file to "
-            "make a change stick.",
+            "No shared storage is set up, and this host wipes its disk on "
+            "restart - nothing you save here will last. See the README "
+            "(`tools/init_gist.py`).",
             icon="\u26a0\ufe0f",
         )
-        if SETTINGS_PATH.exists() or settings.jobs:
-            import json as _json
-            from dataclasses import asdict as _asdict
-
-            st.download_button(
-                "Download settings",
-                _json.dumps(
-                    {
-                        "tableau": _asdict(settings.tableau),
-                        "templates": [_asdict(t) for t in settings.templates],
-                        "lists": [_asdict(d) for d in settings.lists],
-                        "jobs": [_asdict(j) for j in settings.jobs],
-                        "default_theme": settings.default_theme,
-                        "sender_name": settings.sender_name,
-                        "signature": settings.signature,
-                        "keep_local_copies": settings.keep_local_copies,
-                    },
-                    indent=2,
-                ),
-                file_name="settings.default.json",
-                mime="application/json",
-                width="stretch",
-            )
 
     st.markdown("**Saved jobs**")
     job_names = [j.name for j in settings.jobs]
@@ -274,8 +268,8 @@ with st.sidebar:
             st.rerun()
         if c2.button("Delete", width="stretch", disabled=chosen == "-"):
             settings.jobs = [j for j in settings.jobs if j.name != chosen]
-            persist()
-            st.rerun()
+            if persist():
+                st.rerun()
     else:
         st.caption("None yet - configure a report and save it below.")
 
@@ -537,8 +531,8 @@ def _render_compose() -> None:
     if c2.button("Save job", width="stretch", type="secondary"):
         if job.name.strip() and job.name != "Untitled":
             upsert_job(settings, SavedJob(**vars(job)))
-            persist()
-            st.success(f"Saved '{job.name}'")
+            if persist():
+                st.success(f"Saved '{job.name}'")
         else:
             st.warning("Give the job a name first.")
 
@@ -746,8 +740,8 @@ with tab_lists:
                 st.markdown(f"<div class='tm-mono'>{'<br>'.join(dist.to)}</div>", unsafe_allow_html=True)
                 if st.button("Delete", key=f"del_list_{dist.name}"):
                     settings.lists = [d for d in settings.lists if d.name != dist.name]
-                    persist()
-                    st.rerun()
+                    if persist():
+                        st.rerun()
         with st.form("new_list", clear_on_submit=True):
             name = st.text_input("List name")
             to = st.text_area("To", height=80)
@@ -760,8 +754,8 @@ with tab_lists:
                     cc=gmail.parse_addresses(cc),
                     bcc=gmail.parse_addresses(bcc),
                 ))
-                persist()
-                st.rerun()
+                if persist():
+                    st.rerun()
 
     with c2:
         st.markdown("#### Subject templates")
@@ -771,16 +765,16 @@ with tab_lists:
                 st.text(tpl.body)
                 if st.button("Delete", key=f"del_tpl_{tpl.name}"):
                     settings.templates = [t for t in settings.templates if t.name != tpl.name]
-                    persist()
-                    st.rerun()
+                    if persist():
+                        st.rerun()
         with st.form("new_tpl", clear_on_submit=True):
             name = st.text_input("Template name")
             subject = st.text_input("Subject", placeholder="{workbook} - {today:%d.%m.%Y}")
             body = st.text_area("Body", height=120)
             if st.form_submit_button("Save template", width="stretch") and name.strip():
                 upsert_template(settings, SubjectTemplate(name.strip(), subject, body))
-                persist()
-                st.rerun()
+                if persist():
+                    st.rerun()
 
 
 # ---------------------------------------------------------------------------

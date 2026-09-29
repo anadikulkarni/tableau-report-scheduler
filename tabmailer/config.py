@@ -17,6 +17,8 @@ from urllib.parse import urlparse
 
 from dotenv import load_dotenv, set_key
 
+from . import store
+
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = ROOT / "config"
 OUTPUT_DIR = ROOT / "output"
@@ -192,9 +194,18 @@ DEFAULT_TEMPLATES = [
 ]
 
 
+@dataclass(frozen=True)
+class StoreInfo:
+    kind: str = "local"       # gist | local
+    label: str = "This computer"
+    writable: bool = True
+    detail: str = ""
+
+
 @dataclass
 class Settings:
     tableau: TableauSettings = field(default_factory=TableauSettings)
+    store: StoreInfo = field(default_factory=StoreInfo)
     templates: list[SubjectTemplate] = field(default_factory=lambda: list(DEFAULT_TEMPLATES))
     lists: list[DistributionList] = field(default_factory=list)
     jobs: list[SavedJob] = field(default_factory=list)
@@ -216,18 +227,52 @@ def _from_dict(cls, data: dict[str, Any]):
     return cls(**{k: v for k, v in data.items() if k in known})
 
 
-def load_settings() -> Settings:
+def _read_raw() -> tuple[dict, StoreInfo]:
+    """Settings as a plain dict, from shared storage when it is configured."""
+    if store.is_configured():
+        try:
+            blob = store.load()
+        except store.StoreError as exc:
+            # Fall back to the committed defaults rather than starting empty,
+            # and let the app tell the user that saving will not work.
+            raw = _read_file()
+            return raw, StoreInfo(
+                kind="gist", label="Shared storage", writable=False, detail=str(exc)
+            )
+        if blob:
+            return blob, StoreInfo(kind="gist", label="Shared storage", writable=True)
+        # Empty gist: seed it from whatever is on disk.
+        return _read_file(), StoreInfo(kind="gist", label="Shared storage", writable=True)
+
+    info = StoreInfo(
+        kind="local",
+        label="This computer" if not is_ephemeral_host() else "Temporary (not saved)",
+        writable=not is_ephemeral_host(),
+        detail="" if not is_ephemeral_host() else "No shared storage configured.",
+    )
+    return _read_file(), info
+
+
+def _read_file() -> dict:
     # Fall back to the committed defaults when nothing has been saved locally,
     # which is always the case on a freshly built cloud container.
     path = SETTINGS_PATH if SETTINGS_PATH.exists() else DEFAULT_SETTINGS_PATH
     if not path.exists():
-        return _apply_env(Settings())
+        return {}
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return _apply_env(Settings())
+        return {}
+
+
+def load_settings() -> Settings:
+    raw, info = _read_raw()
 
     settings = Settings()
+    settings.store = info
+    if not raw:
+        return _apply_env(settings)
+
     settings.tableau = _from_dict(TableauSettings, raw.get("tableau", {}))
     templates = [_from_dict(SubjectTemplate, t) for t in raw.get("templates", [])]
     settings.templates = templates or list(DEFAULT_TEMPLATES)
@@ -262,10 +307,14 @@ def _apply_env(settings: Settings) -> Settings:
     return settings
 
 
-def save_settings(settings: Settings) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "tableau": asdict(settings.tableau),
+def as_payload(settings: Settings, *, for_sharing: bool = False) -> dict:
+    tableau = asdict(settings.tableau)
+    if for_sharing:
+        # Connection details come from secrets on every host, so keep them out
+        # of the shared document entirely.
+        tableau = {"server_url": "", "site_content_url": "", "token_name": "", "verify_ssl": True}
+    return {
+        "tableau": tableau,
         "templates": [asdict(t) for t in settings.templates],
         "lists": [asdict(d) for d in settings.lists],
         "jobs": [asdict(j) for j in settings.jobs],
@@ -275,7 +324,24 @@ def save_settings(settings: Settings) -> None:
         "signature": settings.signature,
         "keep_local_copies": settings.keep_local_copies,
     }
-    SETTINGS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def save_settings(settings: Settings) -> None:
+    """Persist settings, to shared storage when configured.
+
+    Raises store.StoreError if shared storage is configured but unreachable, so
+    the app can say the save did not stick rather than pretending it did.
+    """
+    if store.is_configured():
+        store.save(as_payload(settings, for_sharing=True))
+        return
+    if is_ephemeral_host():
+        raise store.StoreError(
+            "This app has no shared storage configured, and its filesystem is "
+            "wiped when it restarts, so there is nowhere to save to."
+        )
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    SETTINGS_PATH.write_text(json.dumps(as_payload(settings), indent=2), encoding="utf-8")
 
 
 def save_token_secret(secret: str) -> None:

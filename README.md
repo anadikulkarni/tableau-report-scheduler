@@ -153,14 +153,31 @@ in the code:
 |---|---|
 | Credentials in `.env` and `config/` | `st.secrets`, copied into the environment at startup |
 | Gmail authorised via a browser popup | A refresh token minted once locally, carried in secrets |
-| Saved jobs persist on disk | Disk is wiped on every restart - jobs come from `config/settings.default.json` |
+| Saved jobs persist on disk | A secret GitHub gist holds them, shared by everyone |
 
-### 1. Publish the Google OAuth app
+### 1. Set the Google OAuth app to Internal
 
-**Do this first or the app silently stops sending after a week.** While the
-OAuth consent screen is in **Testing**, Google expires refresh tokens after 7
-days. Google Cloud Console -> **APIs & Services -> OAuth consent screen ->
-Publish app**. (Choose **Internal** instead if you are on Workspace.)
+An **External** consent screen left in **Testing** expires refresh tokens after
+7 days, and moving it to production means a verification review with a homepage,
+privacy policy and branding. Avoid all of that: since the sending account
+(`commercial@nilons.net`) is a Google Workspace account, set the app to
+**Internal** instead.
+
+Google Cloud Console -> **APIs & Services -> OAuth consent screen -> Audience ->
+Make internal**.
+
+Internal apps need no verification, no branding, have no test-user cap, and
+their refresh tokens do not expire on the 7-day rule.
+
+The only restriction is **who may authorise the app**: Workspace accounts on
+your own domain. That costs this app nothing, because exactly one account ever
+authorises it - the mailbox that sends the reports. Colleagues never touch
+Google OAuth; they sign in with the shared password. **Recipients are
+unaffected** - you can still email anyone, inside or outside the domain.
+
+> If **Make internal** is greyed out, the Cloud project sits under a personal
+> Google account rather than the Workspace org. Recreate the OAuth client in a
+> project owned by the organisation.
 
 ### 2. Collect the secrets
 
@@ -206,16 +223,41 @@ Streamlit session state would do.
 
 To sign everyone out at once, change `cookie_secret` in secrets.
 
-### Changing saved reports once deployed
+### Shared settings
 
-The cloud filesystem is temporary: edits made in the hosted app survive until
-the container restarts, and no longer. To make a change permanent:
+Saved reports, subject templates and distribution lists live in a **secret
+GitHub gist**, so everyone using the app sees the same ones and edits stick even
+though Streamlit Cloud wipes its disk on every restart.
 
-1. Edit it in the app
-2. Sidebar -> **Download settings**
-3. Save the file over `config/settings.default.json` and `git push`
+Set it up once:
 
-The sidebar says as much when it detects it is running hosted.
+1. Create a token at [github.com/settings/tokens](https://github.com/settings/tokens)
+   (classic) with the **`gist`** scope ticked and nothing else - it cannot touch
+   your repositories.
+2. Run:
+
+   ```bash
+   set GITHUB_TOKEN=ghp_xxx
+   python tools/init_gist.py
+   ```
+
+   It seeds the gist from your current settings and prints the two lines to add
+   to secrets, locally and on Streamlit Cloud.
+
+After that, anyone signed in can save a template or mailing list and everyone
+else picks it up. The sidebar has a **Reload** button to pull in changes someone
+made while your tab was open.
+
+Two things to know:
+
+- **Last write wins.** Two people saving at the same moment means the later save
+  overwrites the earlier. Fine for a small team; there is no locking.
+- **A secret gist is unlisted, not access-controlled.** Anyone with the link can
+  read it. It holds report configuration and mailing lists, no credentials -
+  connection details are stripped before writing.
+
+Without `GITHUB_TOKEN` and `GITHUB_GIST_ID` the app falls back to a local file,
+and warns in the sidebar if it is running somewhere that will not keep it.
 
 ### Two things that will bite you
 
@@ -286,10 +328,14 @@ tabmailer/
   excel.py          Crosstab parsing, layout detection, formatting, HTML preview
   style.py          Design tokens - colours, fonts, number formats
   gmail.py          OAuth, MIME assembly, send/draft
+  auth.py           Shared-password login, session kept in localStorage
+  store.py          Shared settings via a secret GitHub gist
   templates.py      {token} rendering
   pipeline.py       Download → format → send
   history.py        Send log
 config/             settings.json, credentials, history  (gitignored)
+                    settings.default.json is committed as the seed
+tools/              one-off setup scripts (gist, Gmail secrets)
 output/             Local copies of everything sent      (gitignored)
 ```
 

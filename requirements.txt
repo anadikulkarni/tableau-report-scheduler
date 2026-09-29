@@ -2,6 +2,7 @@ streamlit==1.64.0
 tableauserverclient>=0.38
 openpyxl>=3.1
 python-dotenv>=1.0
+requests>=2.31
 google-api-python-client>=2.100
 google-auth-oauthlib>=1.2
 google-auth>=2.30

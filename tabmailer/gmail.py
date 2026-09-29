@@ -146,9 +146,10 @@ def _credentials_from_env() -> Credentials | None:
         creds.refresh(Request())
     except Exception as exc:  # noqa: BLE001
         raise GmailError(
-            "The stored Gmail refresh token was rejected. If the Google OAuth "
-            "consent screen is still in 'Testing', tokens expire after 7 days - "
-            f"publish the app and mint a new one. ({exc})"
+            "The stored Gmail refresh token was rejected. Most likely the OAuth "
+            "consent screen is an External app still in 'Testing', where tokens "
+            "expire after 7 days - set it to Internal (Workspace) and mint a new "
+            f"token. ({exc})"
         ) from exc
     return creds
 
