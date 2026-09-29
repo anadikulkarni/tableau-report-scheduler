@@ -13,11 +13,49 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import sys
+import tomllib
+from pathlib import Path
 
 from tabmailer import gmail, pipeline
 from tabmailer.config import find_job, load_settings
 from tabmailer.tableau import TableauClient, TableauError
+
+# Keys the app pulls from st.secrets; mirrored here so a scheduled run reads the
+# same credentials instead of drifting from a stale .env.
+_SECRET_KEYS = (
+    "TABLEAU_SERVER_URL",
+    "TABLEAU_SITE",
+    "TABLEAU_TOKEN_NAME",
+    "TABLEAU_TOKEN_SECRET",
+    "GMAIL_CLIENT_ID",
+    "GMAIL_CLIENT_SECRET",
+    "GMAIL_REFRESH_TOKEN",
+    "GITHUB_TOKEN",
+    "GITHUB_GIST_ID",
+)
+
+
+def _load_local_secrets() -> None:
+    """Read .streamlit/secrets.toml into the environment, if it exists.
+
+    Locally this is the single source of truth, so the app and scheduled runs
+    cannot disagree. On a host that injects secrets some other way the file is
+    simply absent and the existing environment wins.
+    """
+    path = Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"
+    if not path.exists():
+        return
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        print(f"warning: could not read {path.name}: {exc}", file=sys.stderr)
+        return
+    for key in _SECRET_KEYS:
+        value = data.get(key)
+        if value not in (None, ""):
+            os.environ[key] = str(value)
 
 
 def main() -> int:
@@ -29,6 +67,7 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Build the files but do not email")
     args = parser.parse_args()
 
+    _load_local_secrets()
     settings = load_settings()
 
     if args.list or not args.job:
@@ -43,6 +82,15 @@ def main() -> int:
     job = find_job(settings, args.job)
     if job is None:
         print(f"No saved job called '{args.job}'.", file=sys.stderr)
+        return 1
+
+    if not job.to and not args.dry_run:
+        # Fail before spending a minute downloading crosstabs nobody receives.
+        print(
+            f"Job '{job.name}' has no recipients. Add them on the Compose tab and "
+            "save the job, or use --dry-run to build the files only.",
+            file=sys.stderr,
+        )
         return 1
 
     today = dt.date.fromisoformat(args.date) if args.date else None
@@ -73,7 +121,8 @@ def main() -> int:
         print(f"wrote {path}")
 
     if args.dry_run:
-        print(f"Dry run - would send '{result.subject}' to {', '.join(job.to)}")
+        recipients = ", ".join(job.to) if job.to else "(nobody - this job has no recipients)"
+        print(f"Dry run - would send '{result.subject}' to {recipients}")
         return 0
 
     try:
