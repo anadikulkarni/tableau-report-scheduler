@@ -21,6 +21,9 @@ ROOT = Path(__file__).resolve().parent.parent
 CONFIG_DIR = ROOT / "config"
 OUTPUT_DIR = ROOT / "output"
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
+# Committed to the repo so a fresh container (Streamlit Cloud rebuilds one on
+# every redeploy and every wake from sleep) still has the saved jobs.
+DEFAULT_SETTINGS_PATH = CONFIG_DIR / "settings.default.json"
 ENV_PATH = ROOT / ".env"
 GMAIL_CLIENT_PATH = CONFIG_DIR / "gmail_credentials.json"
 GMAIL_TOKEN_PATH = CONFIG_DIR / "gmail_token.json"
@@ -29,6 +32,17 @@ HISTORY_PATH = CONFIG_DIR / "history.jsonl"
 CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 load_dotenv(ENV_PATH)
+
+
+def is_ephemeral_host() -> bool:
+    """True when the filesystem won't survive a restart (Streamlit Cloud).
+
+    Anything written to disk there is lost on redeploy or on wake from sleep,
+    so the app should not promise that saving persists.
+    """
+    if os.environ.get("TABMAILER_EPHEMERAL") == "1":
+        return True
+    return bool(os.environ.get("STREAMLIT_RUNTIME_ENV")) or Path("/mount/src").exists()
 
 
 # ---------------------------------------------------------------------------
@@ -203,12 +217,15 @@ def _from_dict(cls, data: dict[str, Any]):
 
 
 def load_settings() -> Settings:
-    if not SETTINGS_PATH.exists():
-        return Settings()
+    # Fall back to the committed defaults when nothing has been saved locally,
+    # which is always the case on a freshly built cloud container.
+    path = SETTINGS_PATH if SETTINGS_PATH.exists() else DEFAULT_SETTINGS_PATH
+    if not path.exists():
+        return _apply_env(Settings())
     try:
-        raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
-        return Settings()
+        return _apply_env(Settings())
 
     settings = Settings()
     settings.tableau = _from_dict(TableauSettings, raw.get("tableau", {}))
@@ -221,6 +238,27 @@ def load_settings() -> Settings:
     settings.sender_name = raw.get("sender_name", "")
     settings.signature = raw.get("signature", "")
     settings.keep_local_copies = raw.get("keep_local_copies", True)
+    return _apply_env(settings)
+
+
+def _apply_env(settings: Settings) -> Settings:
+    """Let the environment override the connection details.
+
+    On Streamlit Cloud these arrive from st.secrets (app.py copies them into the
+    environment at startup); locally they come from .env. Either way the
+    credentials stay out of settings.json and out of git.
+    """
+    tableau = settings.tableau
+    tableau.server_url = normalise_server_url(
+        os.environ.get("TABLEAU_SERVER_URL") or tableau.server_url
+    )
+    tableau.site_content_url = os.environ.get("TABLEAU_SITE", tableau.site_content_url)
+    tableau.token_name = os.environ.get("TABLEAU_TOKEN_NAME") or tableau.token_name
+
+    if is_ephemeral_host():
+        # Writing files on a container that gets rebuilt is pointless, and the
+        # download button in the app is the way to get a copy instead.
+        settings.keep_local_copies = False
     return settings
 
 

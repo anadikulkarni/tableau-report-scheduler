@@ -6,16 +6,19 @@ Run with:  streamlit run app.py     (or double-click run.bat)
 from __future__ import annotations
 
 import datetime as dt
+import os
 
 import streamlit as st
 import streamlit.components.v1 as components
 
-from tabmailer import excel, gmail, history, pipeline, style, templates
+from tabmailer import auth, excel, gmail, history, pipeline, style, templates
 from tabmailer.config import (
     DistributionList,
     GMAIL_CLIENT_PATH,
+    SETTINGS_PATH,
     SavedJob,
     SubjectTemplate,
+    is_ephemeral_host,
     load_settings,
     normalise_server_url,
     save_settings,
@@ -28,6 +31,34 @@ from tabmailer.config import (
 from tabmailer.tableau import TableauClient, TableauError
 
 st.set_page_config(page_title="Tableau Report Mailer", page_icon="📊", layout="wide")
+
+
+# ---------------------------------------------------------------------------
+# Secrets -> environment, before anything reads configuration.
+#
+# Keeping this in app.py (rather than inside tabmailer) means the package never
+# imports Streamlit, so run_job.py and any scheduled runner still work headless.
+# ---------------------------------------------------------------------------
+
+_SECRET_KEYS = (
+    "TABLEAU_SERVER_URL",
+    "TABLEAU_SITE",
+    "TABLEAU_TOKEN_NAME",
+    "TABLEAU_TOKEN_SECRET",
+    "GMAIL_CLIENT_ID",
+    "GMAIL_CLIENT_SECRET",
+    "GMAIL_REFRESH_TOKEN",
+)
+try:
+    for _key in _SECRET_KEYS:
+        _value = st.secrets.get(_key)
+        if _value not in (None, ""):
+            os.environ[_key] = str(_value)
+except Exception:  # noqa: BLE001 - running without a secrets.toml is normal locally
+    pass
+
+# Everything below this line is behind the login.
+CURRENT_USER = auth.require_login()
 
 CSS = """
 <style>
@@ -132,7 +163,7 @@ with st.sidebar:
             help="Tableau Cloud > My Account Settings > Personal Access Tokens.",
         )
         c1, c2 = st.columns(2)
-        if c1.button("Save", use_container_width=True, key="save_tab"):
+        if c1.button("Save", width="stretch", key="save_tab"):
             # People paste the whole address bar; keep only scheme://host, and
             # lift the site out of the pasted URL if the site box is empty.
             settings.tableau.server_url = normalise_server_url(server_url)
@@ -148,7 +179,7 @@ with st.sidebar:
             st.session_state.tableau_verified = False
             st.success(f"Saved · {settings.tableau.server_url}")
             st.rerun()
-        if c2.button("Test", use_container_width=True, key="test_tab"):
+        if c2.button("Test", width="stretch", key="test_tab"):
             try:
                 info = TableauClient(settings.tableau).test_connection()
                 st.session_state.tableau_verified = True
@@ -171,14 +202,17 @@ with st.sidebar:
         else:
             st.caption(f"Client file: `{GMAIL_CLIENT_PATH.name}`")
             c1, c2 = st.columns(2)
-            if c1.button("Connect Gmail", use_container_width=True, key="gm_conn"):
+            if c1.button("Connect Gmail", width="stretch", key="gm_conn"):
                 try:
                     addr = gmail.authorised_address()
                     st.success(f"Authorised as {addr}")
                     st.rerun()
                 except gmail.GmailError as exc:
                     st.error(str(exc))
-            if c2.button("Sign out", use_container_width=True, key="gm_out"):
+            # Deliberately not "Sign out" - that is the app login, and this
+            # button throws away the cached Gmail token.
+            if c2.button("Disconnect", width="stretch", key="gm_out",
+                         help="Forget the cached Gmail token and re-authorise."):
                 gmail.revoke_local_token()
                 st.rerun()
 
@@ -192,27 +226,65 @@ with st.sidebar:
         settings.keep_local_copies = st.checkbox(
             "Keep a local copy of every file", value=settings.keep_local_copies
         )
-        if st.button("Save defaults", use_container_width=True, key="save_def"):
+        if st.button("Save defaults", width="stretch", key="save_def"):
             persist()
             st.success("Saved")
 
     st.divider()
+    if is_ephemeral_host():
+        st.warning(
+            "Hosted mode: anything you save here lasts only until the app "
+            "restarts. Use **Download settings** below and commit the file to "
+            "make a change stick.",
+            icon="\u26a0\ufe0f",
+        )
+        if SETTINGS_PATH.exists() or settings.jobs:
+            import json as _json
+            from dataclasses import asdict as _asdict
+
+            st.download_button(
+                "Download settings",
+                _json.dumps(
+                    {
+                        "tableau": _asdict(settings.tableau),
+                        "templates": [_asdict(t) for t in settings.templates],
+                        "lists": [_asdict(d) for d in settings.lists],
+                        "jobs": [_asdict(j) for j in settings.jobs],
+                        "default_theme": settings.default_theme,
+                        "sender_name": settings.sender_name,
+                        "signature": settings.signature,
+                        "keep_local_copies": settings.keep_local_copies,
+                    },
+                    indent=2,
+                ),
+                file_name="settings.default.json",
+                mime="application/json",
+                width="stretch",
+            )
+
     st.markdown("**Saved jobs**")
     job_names = [j.name for j in settings.jobs]
     if job_names:
         chosen = st.selectbox("Load a job", ["-"] + job_names, label_visibility="collapsed")
         c1, c2 = st.columns(2)
-        if c1.button("Load", use_container_width=True, disabled=chosen == "-"):
+        if c1.button("Load", width="stretch", disabled=chosen == "-"):
             loaded = next(j for j in settings.jobs if j.name == chosen)
             st.session_state.job = SavedJob(**vars(loaded))
             st.session_state.build = None
             st.rerun()
-        if c2.button("Delete", use_container_width=True, disabled=chosen == "-"):
+        if c2.button("Delete", width="stretch", disabled=chosen == "-"):
             settings.jobs = [j for j in settings.jobs if j.name != chosen]
             persist()
             st.rerun()
     else:
         st.caption("None yet - configure a report and save it below.")
+
+    st.divider()
+    c1, c2 = st.columns([2, 1])
+    c1.caption(f"Signed in as **{CURRENT_USER}**")
+    if c2.button("Sign out", width="stretch", key="sign_out"):
+        auth.logout()
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +326,7 @@ def _render_compose() -> None:
                 st.error(str(exc))
                 return
     workbooks = st.session_state.workbooks or []
-    if c2.button("Refresh", use_container_width=True, key="refresh_wb"):
+    if c2.button("Refresh", width="stretch", key="refresh_wb"):
         st.session_state.workbooks = None
         st.session_state.views = {}
         st.rerun()
@@ -306,7 +378,7 @@ def _render_compose() -> None:
 
     c1, c2 = st.columns(2)
     with c1:
-        if st.button("Select all worksheets", use_container_width=True):
+        if st.button("Select all worksheets", width="stretch"):
             job.view_ids = [v.id for v in sheets]
             st.rerun()
         chosen_labels = st.multiselect(
@@ -413,7 +485,7 @@ def _render_compose() -> None:
     tpl_names = [t.name for t in settings.templates]
     c1, c2 = st.columns([3, 2])
     picked = c1.selectbox("Start from a saved template", ["-"] + tpl_names)
-    if c2.button("Apply template", use_container_width=True, disabled=picked == "-"):
+    if c2.button("Apply template", width="stretch", disabled=picked == "-"):
         tpl = next(t for t in settings.templates if t.name == picked)
         job.subject, job.body = tpl.subject, tpl.body
         st.rerun()
@@ -435,7 +507,7 @@ def _render_compose() -> None:
     with st.expander("Available tokens"):
         st.dataframe(
             [{"Token": t, "Meaning": d, "Right now": v} for t, d, v in templates.preview_tokens(context)],
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
         )
 
     # -- 5. recipients -----------------------------------------------------
@@ -444,7 +516,7 @@ def _render_compose() -> None:
     if list_names:
         c1, c2 = st.columns([3, 2])
         chosen_list = c1.selectbox("Use a saved list", ["-"] + list_names)
-        if c2.button("Apply list", use_container_width=True, disabled=chosen_list == "-"):
+        if c2.button("Apply list", width="stretch", disabled=chosen_list == "-"):
             dist = next(d for d in settings.lists if d.name == chosen_list)
             job.to, job.cc, job.bcc = list(dist.to), list(dist.cc), list(dist.bcc)
             st.rerun()
@@ -462,7 +534,7 @@ def _render_compose() -> None:
     st.divider()
     c1, c2 = st.columns([3, 1])
     job.name = c1.text_input("Save this whole configuration as", value=job.name)
-    if c2.button("Save job", use_container_width=True, type="secondary"):
+    if c2.button("Save job", width="stretch", type="secondary"):
         if job.name.strip() and job.name != "Untitled":
             upsert_job(settings, SavedJob(**vars(job)))
             persist()
@@ -533,13 +605,13 @@ def render_result(result: pipeline.BuildResult, target: SavedJob, key: str) -> N
             )
             c2.download_button(
                 "Download", f.content, file_name=f.filename,
-                use_container_width=True, key=f"dl_{key}_{f.filename}",
+                width="stretch", key=f"dl_{key}_{f.filename}",
             )
     if result.inline_images:
         st.caption(f"{len(result.inline_images)} dashboard image(s) embedded in the email body")
         for img in result.inline_images:
             try:
-                st.image(img.content, caption=img.caption, use_container_width=True)
+                st.image(img.content, caption=img.caption, width="stretch")
             except Exception:  # noqa: BLE001 - a bad render shouldn't kill the page
                 st.warning(
                     f"'{img.caption}' came back from Tableau as something that isn't a "
@@ -568,14 +640,14 @@ def render_result(result: pipeline.BuildResult, target: SavedJob, key: str) -> N
             f"total, to {len(target.to)} recipient(s)."
         )
         c1, c2, _ = st.columns([1, 1, 2])
-        if c1.button("Send now", type="primary", use_container_width=True, key=f"send_{key}"):
+        if c1.button("Send now", type="primary", width="stretch", key=f"send_{key}"):
             try:
                 outcome = pipeline.send(result, target, settings, target.to, target.cc, target.bcc)
                 st.success(f"Sent from {outcome.get('sender', '')}.")
                 st.balloons()
             except gmail.GmailError as exc:
                 st.error(str(exc))
-        if c2.button("Save as draft", use_container_width=True, key=f"draft_{key}"):
+        if c2.button("Save as draft", width="stretch", key=f"draft_{key}"):
             try:
                 pipeline.send(result, target, settings, target.to, target.cc, target.bcc, as_draft=True)
                 st.success("Draft saved in Gmail.")
@@ -623,7 +695,7 @@ def _render_send() -> None:
                 unsafe_allow_html=True,
             )
             c1.caption("To: " + (", ".join(saved.to) if saved.to else "no recipients set"))
-            if c2.button("Build & review", type="primary", use_container_width=True,
+            if c2.button("Build & review", type="primary", width="stretch",
                          key=f"quick_{saved.name}"):
                 st.session_state.job = SavedJob(**vars(saved))
                 build_result(st.session_state.job)
@@ -650,7 +722,7 @@ with tab_preview:
         st.info("Choose a workbook and some worksheets on the Compose tab first.")
     else:
         c1, c2 = st.columns([1, 3])
-        if c1.button("Build report", type="primary", use_container_width=True):
+        if c1.button("Build report", type="primary", width="stretch"):
             build_result(job)
 
         result = st.session_state.build
@@ -681,7 +753,7 @@ with tab_lists:
             to = st.text_area("To", height=80)
             cc = st.text_area("Cc", height=60)
             bcc = st.text_area("Bcc", height=60)
-            if st.form_submit_button("Save list", use_container_width=True) and name.strip():
+            if st.form_submit_button("Save list", width="stretch") and name.strip():
                 upsert_list(settings, DistributionList(
                     name=name.strip(),
                     to=gmail.parse_addresses(to),
@@ -705,7 +777,7 @@ with tab_lists:
             name = st.text_input("Template name")
             subject = st.text_input("Subject", placeholder="{workbook} - {today:%d.%m.%Y}")
             body = st.text_area("Body", height=120)
-            if st.form_submit_button("Save template", use_container_width=True) and name.strip():
+            if st.form_submit_button("Save template", width="stretch") and name.strip():
                 upsert_template(settings, SubjectTemplate(name.strip(), subject, body))
                 persist()
                 st.rerun()
@@ -734,5 +806,5 @@ with tab_history:
                 }
                 for e in entries
             ],
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
         )

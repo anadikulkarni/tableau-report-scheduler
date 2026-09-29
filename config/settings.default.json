@@ -1,0 +1,78 @@
+{
+  "tableau": {
+    "server_url": "",
+    "site_content_url": "",
+    "token_name": "",
+    "verify_ssl": true
+  },
+  "templates": [
+    {
+      "name": "Daily sales report",
+      "subject": "{workbook} - {today:%d.%m.%Y}",
+      "body": "Hi all,\n\nPlease find attached the {workbook} for {today:%d %B %Y}.\n\nSheets included: {views}\n\nRegards"
+    },
+    {
+      "name": "Yesterday's figures",
+      "subject": "{workbook} - figures for {yesterday:%d %b %Y}",
+      "body": "Hi all,\n\nAttached are the figures for {yesterday:%d %B %Y}.\n\nRegards"
+    },
+    {
+      "name": "Monthly report",
+      "subject": "{workbook} - {month} {year}",
+      "body": "Hi all,\n\nAttached is the {workbook} for {month} {year}.\n\nRegards"
+    }
+  ],
+  "lists": [],
+  "jobs": [
+    {
+      "name": "Daily Sales Report",
+      "workbook_id": "edf57138-192c-4135-b3b7-fb5b7542a74b",
+      "workbook_name": "Daily Sales Report",
+      "view_ids": [
+        "2afe763c-11b7-41ce-8d46-d02e94b54d27",
+        "1f27f9ae-90e4-425f-a345-ff9e62a2f9ec",
+        "fa1c6908-43f6-4400-a204-84be49e3230d",
+        "3ed07906-4552-42c5-b78a-ed5f50824b4a",
+        "6ed3844e-cb82-4a85-86be-cd1068ff5d4d"
+      ],
+      "view_names": [
+        "Daily Sales Report: ASM Area Wise",
+        "Daily Sales Report: Customer Wise",
+        "Daily Sales Report: GT Area Wise",
+        "Daily Sales Report: Non-GT Area Wise",
+        "Daily Sales Report: Purchase Orders"
+      ],
+      "content_mode": "crosstab",
+      "dashboard_view_ids": [],
+      "body_table_view_ids": [
+        "24310a56-650a-4f08-aac2-0d4dc12396c7"
+      ],
+      "body_table_view_names": [
+        "Daily Sales Report: Channel Wise Overview"
+      ],
+      "body_table_max_rows": 100,
+      "one_file_per_view": false,
+      "subject": "Daily Sales Report - {today:%d.%m.%Y}",
+      "body": "Hi all,\n\nPlease find the channel-wise summary for {today:%d %B %Y} below, with the full area, customer and purchase detail in the attached Excel.\n\n{tables}\n\nRegards",
+      "filename": "Daily Sales Report - {today}.xlsx",
+      "to": [
+        "anadi.kulkarni@nilons.net"
+      ],
+      "cc": [],
+      "bcc": [],
+      "theme": "Blue",
+      "negatives_red": false,
+      "banded_rows": false,
+      "autofilter": true,
+      "freeze_mode": "auto",
+      "filters": {},
+      "report_title": "DAILY SALES REPORT",
+      "builtin": true
+    }
+  ],
+  "default_theme": "Blue",
+  "output_dir": "D:\\anadi.k\\Github\\tableau-report-scheduler\\output",
+  "sender_name": "Nilons Bi",
+  "signature": "",
+  "keep_local_copies": false
+}

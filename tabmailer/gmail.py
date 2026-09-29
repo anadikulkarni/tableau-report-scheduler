@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import mimetypes
+import os
 import re
 from dataclasses import dataclass, field
 from email.message import EmailMessage
@@ -105,15 +106,58 @@ def invalid_addresses(addresses: Sequence[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def env_credentials_present() -> bool:
+    return all(
+        os.environ.get(k)
+        for k in ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN")
+    )
+
+
 def client_secret_present() -> bool:
-    return GMAIL_CLIENT_PATH.exists()
+    return env_credentials_present() or GMAIL_CLIENT_PATH.exists()
 
 
 def is_authorised() -> bool:
-    return GMAIL_TOKEN_PATH.exists()
+    return env_credentials_present() or GMAIL_TOKEN_PATH.exists()
+
+
+def _credentials_from_env() -> Credentials | None:
+    """Build credentials from a pre-issued refresh token.
+
+    The desktop OAuth flow opens a browser on whatever machine runs the code,
+    which is useless on a headless host like Streamlit Cloud. So a token minted
+    once locally is carried in the environment (from st.secrets) instead.
+    """
+    client_id = os.environ.get("GMAIL_CLIENT_ID")
+    client_secret = os.environ.get("GMAIL_CLIENT_SECRET")
+    refresh_token = os.environ.get("GMAIL_REFRESH_TOKEN")
+    if not (client_id and client_secret and refresh_token):
+        return None
+
+    creds = Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        client_id=client_id,
+        client_secret=client_secret,
+        token_uri="https://oauth2.googleapis.com/token",
+        scopes=SCOPES,
+    )
+    try:
+        creds.refresh(Request())
+    except Exception as exc:  # noqa: BLE001
+        raise GmailError(
+            "The stored Gmail refresh token was rejected. If the Google OAuth "
+            "consent screen is still in 'Testing', tokens expire after 7 days - "
+            f"publish the app and mint a new one. ({exc})"
+        ) from exc
+    return creds
 
 
 def load_credentials(interactive: bool = True) -> Credentials:
+    env_creds = _credentials_from_env()
+    if env_creds is not None:
+        return env_creds
+
     if not GMAIL_CLIENT_PATH.exists():
         raise GmailError(
             f"Missing OAuth client file. Save your Google Cloud desktop-app JSON as {GMAIL_CLIENT_PATH}."

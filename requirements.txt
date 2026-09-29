@@ -1,5 +1,5 @@
-streamlit>=1.40
-tableauserverclient>=0.34
+streamlit==1.64.0
+tableauserverclient>=0.38
 openpyxl>=3.1
 python-dotenv>=1.0
 google-api-python-client>=2.100

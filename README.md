@@ -142,6 +142,90 @@ send in two clicks.
 
 ---
 
+
+## Sharing it with colleagues (Streamlit Cloud)
+
+The app runs fine on [Streamlit Community Cloud](https://share.streamlit.io).
+Three things differ from running it locally, and all three are already handled
+in the code:
+
+| Locally | On Streamlit Cloud |
+|---|---|
+| Credentials in `.env` and `config/` | `st.secrets`, copied into the environment at startup |
+| Gmail authorised via a browser popup | A refresh token minted once locally, carried in secrets |
+| Saved jobs persist on disk | Disk is wiped on every restart - jobs come from `config/settings.default.json` |
+
+### 1. Publish the Google OAuth app
+
+**Do this first or the app silently stops sending after a week.** While the
+OAuth consent screen is in **Testing**, Google expires refresh tokens after 7
+days. Google Cloud Console -> **APIs & Services -> OAuth consent screen ->
+Publish app**. (Choose **Internal** instead if you are on Workspace.)
+
+### 2. Collect the secrets
+
+```bash
+python tools/export_gmail_secrets.py
+```
+
+Fill in `.streamlit/secrets.toml` using `.streamlit/secrets.toml.example` as the
+shape. Keep it - you paste the same content into the cloud in step 4.
+
+### 3. Push
+
+```bash
+git push
+```
+
+`config/settings.default.json` is committed on purpose: it carries the saved
+reports. `.env`, `.streamlit/secrets.toml` and everything in `config/` that
+holds credentials stay ignored.
+
+### 4. Deploy
+
+1. [share.streamlit.io](https://share.streamlit.io) -> **Create app** -> pick
+   `tableau-report-scheduler`, branch `main`, file `app.py`
+2. **Advanced settings -> Secrets** -> paste your whole `secrets.toml`
+3. Deploy
+
+### 5. Lock it down
+
+The app is behind a shared username and password from the `[auth]` block in
+secrets. Give those to the people who should be able to send reports.
+
+For a second layer, set the app to **private** in Streamlit Cloud settings and
+invite colleagues by email - then they need both a Google account on the
+allowlist and the password.
+
+### Signing in
+
+Everyone uses the same credential. A successful login stores a signed token in
+that browser's `localStorage`, so people stay signed in for `session_days` (30
+by default) instead of being logged out on every refresh - which is what plain
+Streamlit session state would do.
+
+To sign everyone out at once, change `cookie_secret` in secrets.
+
+### Changing saved reports once deployed
+
+The cloud filesystem is temporary: edits made in the hosted app survive until
+the container restarts, and no longer. To make a change permanent:
+
+1. Edit it in the app
+2. Sidebar -> **Download settings**
+3. Save the file over `config/settings.default.json` and `git push`
+
+The sidebar says as much when it detects it is running hosted.
+
+### Two things that will bite you
+
+- **Tableau personal access tokens die after 15 days of no use.** An app that
+  only gets opened occasionally will hit this and start failing sign-in. Mint a
+  new token and update `TABLEAU_TOKEN_SECRET`.
+- **Community Cloud apps sleep when idle.** The first visit after a nap takes a
+  few seconds to wake. There is no cron there either, so scheduled sends need
+  GitHub Actions or a machine running `run_job.py`.
+
 ## Scheduling
 
 Saved jobs can run unattended:

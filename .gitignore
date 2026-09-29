@@ -1,5 +1,6 @@
 .env
 config/settings.json
+!config/settings.default.json
 config/gmail_credentials.json
 config/gmail_token.json
 config/history.jsonl
